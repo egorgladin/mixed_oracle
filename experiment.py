@@ -4,52 +4,74 @@ from matplotlib.ticker import MaxNLocator
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
-from scipy.special import expit
+from sklearn.metrics import accuracy_score, log_loss
+from scipy.linalg import eigh
+from scipy.special import softmax
+import mnist
+import pickle
+import time
 
 from combined_method import combined_method
 
-# 1. get data Z, t - DONE
-# 2. train 2 SVMs and 2 LogRegs - DONE
-# 3. construct F, dF_dx
-# 4. run experiment
-
 
 def get_data():
-    Z = np.load('x_train.npy')
-    t = np.load('y_train.npy') * 2 - 1
+    Z = mnist.train_images()
+    Z = Z.reshape((Z.shape[0], Z.shape[1] * Z.shape[2]))
+    t = mnist.train_labels()
 
     scaler = StandardScaler()
-    Z_new = scaler.fit_transform(Z, t)
+    Z = scaler.fit_transform(Z, t)
 
-    Z_test = np.load('x_test.npy')
-    t_test = np.load('y_test.npy') * 2 - 1
-    Z_test_new = scaler.transform(Z_test)
-    return Z_new, t, Z_test_new, t_test, scaler
+    Z_test = mnist.test_images()
+    Z_test = Z_test.reshape((Z_test.shape[0], Z_test.shape[1] * Z_test.shape[2]))
+    t_test = mnist.test_labels()
+    Z_test = scaler.transform(Z_test)
+
+    return Z, t, Z_test, t_test, scaler
+
+
+def model_to_fname(model_names):
+    file_names = [name[:-3] + '_' + name[-1] + '.pickle'
+                  for name in model_names]
+    return file_names
+
+
+def get_svm(Z, t):
+    svm = LinearSVC(dual=False, C=0.1, verbose=1, max_iter=200).fit(Z, t)
+    return svm
+
+
+def get_logreg(Z, t, seed):
+    logreg = LogisticRegression(random_state=seed, penalty='none', solver='sag',
+                                multi_class='multinomial').fit(Z, t)
+    return logreg
 
 
 def get_models(Z, t):
-    middle = Z.shape[0] // 2
-    svm1 = LinearSVC(random_state=0, tol=1e-5)
-    svm1.fit(Z[:middle], t[:middle])
+    model_names = ['SVM #1', 'SVM #2', 'LogReg #1', 'LogReg #2']
+    file_names = model_to_fname(model_names)
+    models = []
+    mid = Z.shape[0] // 2
 
-    svm2 = LinearSVC(random_state=0, tol=1e-5)
-    svm2.fit(Z[middle:], t[middle:])
+    for i, name in enumerate(file_names):
+        try:
+            with open(name, 'rb') as handle:
+                models.append(pickle.load(handle))
+        except IOError:
+            Z_, t_ = (Z[mid:], t[mid:]) if i % 2 else (Z[:mid], t[:mid])
+            model = get_logreg(Z_, t_, i) if i // 2 else get_svm(Z_, t_)
+            models.append(model)
+            with open(name, 'wb') as handle:
+                pickle.dump(model, handle)
 
-    logreg1 = LogisticRegression(random_state=0)
-    logreg1.fit(Z[:middle], t[:middle])
-
-    logreg2 = LogisticRegression(random_state=0)
-    logreg2.fit(Z[middle:], t[middle:])
-
-    return [svm1, svm2, logreg1, logreg2]
+    return models, model_names
 
 
 def check_trained():
-    Z, t, _, _, _ = get_data()
-    models = get_models(Z, t)
+    Z, t, Z_test, t_test, _ = get_data()
+    models, model_names = get_models(Z, t)
     for mdl in models:
-        print(mdl.score(Z, t))
+        print(mdl.score(Z_test, t_test))
 
 
 def plot_digits(scaler, id, advers, orig):
@@ -58,113 +80,135 @@ def plot_digits(scaler, id, advers, orig):
     fig, ax = plt.subplots(2)
     ax[0].imshow(orig_rescaled.reshape(28, 28), cmap='binary')
     ax[1].imshow(advers_rescaled.reshape(28, 28), cmap='binary')
-    plt.savefig(f"images/attack {id}.png")
+    plt.savefig(f"thesis_digits/attack_{id}.png")
 
 
-def experiment_combined(N, tau, eps, K, newton_steps, reg):
+def get_starting_point(n_models, image_size):
+    x_0 = np.ones((n_models-1, 1)) / n_models
+    np.random.seed(0)
+    y_0 = np.random.randn(image_size, 1)
+    y_0 /= np.linalg.norm(y_0)
+    return x_0, y_0
+
+
+def max_eigval(A):
+    n = A.shape[0]
+    return eigh(A, eigvals_only=True, subset_by_index=[n-1, n-1]).item()
+
+
+def plot(data, xy_label, fname, logscale=False):
+    fig, ax = plt.subplots()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    for name, values in data.items():
+        style = '--' if name[-1] == '1' else ':'
+        plt.plot(values, label=name, linestyle=style, alpha=0.6)
+    plt.xlabel(xy_label[0])
+    plt.ylabel(xy_label[1])
+    plt.grid()
+    plt.legend()
+    if logscale:
+        plt.yscale('log')
+    plt.savefig(fname, bbox_inches='tight')
+
+
+def get_losses(models, example, perturbation, label):
+    adversarial_example = (example + perturbation).T
+    losses = []
+    for model in models:
+        try:
+            proba = model.predict_proba(adversarial_example)
+        except AttributeError:
+            scores = model.decision_function(adversarial_example)
+            proba = softmax(scores)
+        losses.append(log_loss([label], proba, labels=range(10)))
+    return losses
+
+
+def experiment_combined(N, tau, eps, eta, K, newton_steps, stepsize, mu):
     Z, t, Z_test, t_test, scaler = get_data()
-    models = get_models(Z, t)
-    model_names = ['SVM #1', 'SVM #2', 'LogReg #1', 'LogReg #2']
-    parameter_vectors = np.vstack([clf.coef_[0] for clf in models])
-
-    mu = 2 * reg
-    L = np.max(np.linalg.norm(parameter_vectors, axis=1)) + 2 * reg
+    models, model_names = get_models(Z, t)
+    weight_matrices = [clf.coef_ for clf in models]
+    Ls = [max_eigval(V.T @ V) for V in weight_matrices]
+    max_eigv = max(Ls)
+    gamma = max_eigv / 100 + mu
 
     n_models = len(models)
-    x_0 = np.ones((n_models, 1)) / n_models
+    x_0, y_0 = get_starting_point(n_models, Z.shape[1])
 
-    np.random.seed(0)
-    y_0 = np.random.randn(Z.shape[1], 1)
-    y_0 /= np.linalg.norm(y_0)
+    vaidya_params = {'d': n_models-1, 'eps': eps, 'eta': eta, 'K': K, 'newton_steps': newton_steps, 'stepsize': stepsize}
+    arddsc_params = {'N': N, 'tau': tau, 'mu': mu, 'L': gamma}
 
-    vaidya_params = {'d': n_models, 'eps': eps, 'K': K, 'newton_steps': newton_steps}
-    arddsc_params = {'N': N, 'tau': tau, 'mu': mu, 'L': L}
+    n_attacks = 50
+    start_n = 0
+    Z_adv = np.zeros((n_attacks, Z.shape[1]))
 
-    N_ATTACKS = 200
-    Z_test = Z_test[:N_ATTACKS]
-    t_test = t_test[:N_ATTACKS]
-    LOSSES = {name: np.zeros((N_ATTACKS, K+1)) for name in model_names}
-    Z_adv = np.zeros((N_ATTACKS, Z.shape[1]))
-    for id in range(N_ATTACKS):
-        if id % 10 == 0:
-            print(f"attack #{id}")
-        original_example = np.expand_dims(Z_test[id], axis=1)
+    for id in range(n_attacks):
+        print(f"{'='*20} attack #{id} {'='*20}")
+        original_example = np.expand_dims(Z_test[start_n+id], axis=1)
         label = t_test[id]
-
-        def F(x, y):
-            # y is perturbation
-            adversarial_example = original_example + y
-            exponents = -np.squeeze(parameter_vectors @ adversarial_example) * label
-            losses = -np.log(expit(-exponents))
-            return (np.squeeze(x) @ losses).item() - reg * np.linalg.norm(y)**2
 
         def dF_dx(x, y):
             # y is perturbation
-            adversarial_example = original_example + y
-            exponents = -np.squeeze(parameter_vectors @ adversarial_example) * label
-            losses = -np.log(expit(-exponents))
-            return np.expand_dims(losses, axis=1)
+            losses = get_losses(models, original_example, y, label)
+            loss_differences = [loss - losses[-1] for loss in losses[:-1]]
+            return np.expand_dims(loss_differences, axis=1)
 
-        xs, ys, aux_evals = combined_method(x_0, y_0, dF_dx, F, vaidya_params, arddsc_params)
-        Fs = [F(x, y) for x, y in zip(xs, ys) if np.linalg.norm(y) < 20]
-        best_idx = np.argmax(Fs).item()
-        adversarial_result = original_example + ys[best_idx]
-        # if id == 0 or id == 2:
-        # print('='*20, f'id {id}, norm:', np.linalg.norm(ys[best_idx]), '='*20)
-        Z_adv[id] = adversarial_result[:, 0]
-        plot_digits(scaler, id, adversarial_result, original_example)
+        def F(x, y):
+            losses = get_losses(models, original_example, y, label)
+            w = np.append(np.squeeze(x), 1 - x.sum())
+            return w @ losses - gamma * np.linalg.norm(y)**2 / 2
 
-        losses_ = [dF_dx(x, y) for x, y in zip(xs, ys)]
-        # fig, ax = plt.subplots()
-        for i in range(n_models):
-            model_loss = [loss[i] for loss in losses_]
-            LOSSES[model_names[i]][id] = model_loss
-            # plt.plot([loss[i] for loss in losses_], label="loss " + model_names[i])
-        # plt.title(f"losses_combined")
-        # plt.legend()
-        # plt.savefig(f"losses_combined.png")
+        start = time.time()
+        xs, ys, aux_evals, y_op, _ = combined_method(x_0, y_0, dF_dx, F, vaidya_params, arddsc_params)
 
-        # fig, ax = plt.subplots()
-        # for i in range(n_models):
-        #     model_loss = [x_[i] for x_ in xs]
-            # plt.plot([x_[i] for x_ in xs], label="coef " + model_names[i])
-        # plt.title(f"coefs")
-        # plt.legend()
-        # plt.savefig(f"coefs.png")
-    fig, ax = plt.subplots()
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    for i in range(n_models):
-        model_loss = LOSSES[model_names[i]].mean(axis=0)
-        plt.plot(model_loss, label=model_names[i])
-    # plt.title(f"losses_avg")
-    plt.ylabel("LogLoss")
-    plt.xlabel("Outer iterations")
-    plt.grid()
-    plt.legend()
-    plt.savefig(f"losses_avg.png", bbox_inches='tight')
+        adversarial_example = original_example + y_op
+        plot_digits(scaler, start_n+id, adversarial_example, original_example)
+        Z_adv[id] = adversarial_example[:, 0]
+        print(f"attack #{id} took {time.time() - start:.1f} s")
 
-    print('='*40)
-    print('='*40)
+    np.save("Z_adv.npy", Z_adv)
     for i in range(n_models):
         print('MODEL:', model_names[i])
-        orig_pred = models[i].predict(Z_test)
+        orig_pred = models[i].predict(Z_test[start_n:start_n+n_attacks])
         advers_pred = models[i].predict(Z_adv)
         success = (orig_pred != advers_pred).nonzero()
         print(f"Successful attacks:\n{success}")
-        print("Accuracy orig:", accuracy_score(t_test, orig_pred))
-        print("Accuracy advers:", accuracy_score(t_test, advers_pred))
+        print("Accuracy orig:", accuracy_score(t_test[start_n:start_n+n_attacks], orig_pred))
+        print("Accuracy advers:", accuracy_score(t_test[start_n:start_n+n_attacks], advers_pred))
+
+
+def get_successful():
+    Z, t, Z_test, t_test, scaler = get_data()
+    models, model_names = get_models(Z, t)
+    Z_adv = np.load("Z_adv.npy")
+    n_attacks = 50
+    successes, orig_preds, advers_preds = dict(), dict(), dict()
+    for model, name in zip(models, model_names):
+        orig_preds[name] = model.predict(Z_test[:n_attacks])
+        advers_preds[name] = model.predict(Z_adv)
+        correct_orig = orig_preds[name] == t_test[:n_attacks]
+        incorrec_att = advers_preds[name] != t_test[:n_attacks]
+        success = (np.logical_and(correct_orig, incorrec_att)).nonzero()
+        successes[name] = set(success[0])
+    res = set.intersection(*[successes[name] for name in model_names])
+    for idx in list(res):
+        print(f"successful attack: #{idx}, true digit: {orig_preds[model_names[0]][idx]}")
+        print(f"false predictions: {[advers_preds[name][idx] for name in model_names]}")
+    print(res)
 
 
 def main():
     N = 1
-    tau = 0.01
+    tau = 1e-4
+    eta = 1.
     eps = 1e-2
-    K = 20
-    newton_steps = 5
-    reg = 1e-3
-    experiment_combined(N, tau, eps, K, newton_steps, reg)
-    # check_trained()
+    K = 200
+    newton_steps = 2
+    stepsize = 0.05
+    mu = 0.02
+    experiment_combined(N, tau, eps, eta, K, newton_steps, stepsize, mu)
 
 
 if __name__ == "__main__":
     main()
+    get_successful()

@@ -2,7 +2,8 @@ import numpy as np
 
 
 def get_grad_approx(x, tau, e, oracle, dim):
-    return dim * (oracle(x + tau * e) - oracle(x)) * e / tau
+    val = oracle(x)
+    return val, (oracle(x + tau * e) - val) * e / tau  # dim *
 
 
 def sample_spherical(dim, seed_me=None):
@@ -17,6 +18,7 @@ def ardd(x_0, oracle, L, N, tau):
     """Use ARDD to minimize g(y)."""
     dim = len(x_0)
     pts = [x_0.copy()]
+    vals = []
 
     z = x_0.copy()
     w = x_0.copy()
@@ -26,31 +28,36 @@ def ardd(x_0, oracle, L, N, tau):
         t = 2 / (k + 2)
         x = t * z + (1 - t) * w
 
-        grad_approx = get_grad_approx(x, tau, e, oracle, dim)
+        val, grad_approx = get_grad_approx(x, tau, e, oracle, dim)
+        vals.append(val)
         w = x - grad_approx / (2 * L)
-        # if np.linalg.norm(grad_approx) > 100 or np.linalg.norm(w) > 100:
-        #     print(f"iteration {k}: large norm!")
         pts.append(w)
 
         alpha = (k + 1) / (96 * dim**2 * L)
         z -= alpha * grad_approx
 
-    return pts
+    vals.append(oracle(pts[-1]))
+    return pts, vals
 
 
-def arddsc(x_0, oracle, L, mu, N, tau):
+def arddsc(x_0, oracle, L, mu, N, tau, last=False):
     """Use ARDDsc to minimize g(y)."""
     pts = [x_0.copy()]
+    vals = [oracle(x_0)]
     dim = len(x_0)
 
     u = x_0
     a = 384 * dim**2
-    CHEAT = 50000000
-    N_0 = int(np.ceil(np.sqrt(8 * a * L / (mu * CHEAT))))
+    if last:
+        factor = 1000
+    else:
+        factor = 1000000
+    N_0 = int(np.ceil(np.sqrt(8 * a * L / (mu * factor))))
 
     for k in range(N):
-        inner_pts = ardd(u, oracle, L, N_0, tau)
+        inner_pts, inner_vals = ardd(u, oracle, L, N_0, tau)
         pts += inner_pts[1:]
+        vals += inner_vals[1:]
         u = inner_pts[-1]
 
-    return pts
+    return pts, vals

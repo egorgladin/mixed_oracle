@@ -43,7 +43,7 @@ def get_dV(sigmas, A, b, x):
     return dV
 
 
-def get_vol_center(A, b, x, n_steps=20, stepsize=0.18):
+def get_vol_center(A, b, x, n_steps=20, stepsize=0.10):
     vals = np.zeros(n_steps)
     for step in range(n_steps):
         H_inv = get_H_inv(A, b, x)
@@ -55,9 +55,9 @@ def get_vol_center(A, b, x, n_steps=20, stepsize=0.18):
     return x
 
 
-def get_beta(A, c, x, eps, H_inv):
-    denom = np.sqrt(eps) * c.T @ H_inv @ c
-    beta = x.T @ c - np.sqrt(5. / denom)
+def get_beta(A, c, x, eps, eta, H_inv):
+    squared = 2 * c.T @ H_inv @ c / np.sqrt(eps * eta)
+    beta = x.T @ c - np.sqrt(squared)
     return beta
 
 
@@ -73,7 +73,7 @@ def remove_row(A, b, i):
     return A, b
 
 
-def vaidya(A_0, b_0, x_0, y_0, eps, K, oracle, newton_steps=10, verbose=False):
+def vaidya(A_0, b_0, x_0, y_0, eps, eta, K, oracle, newton_steps=10, stepsize=0.18, verbose=True):
     """Use Vaidya's method to minimize f(x)."""
     A_k, b_k = A_0, b_0
     x_k = x_0
@@ -82,15 +82,17 @@ def vaidya(A_0, b_0, x_0, y_0, eps, K, oracle, newton_steps=10, verbose=False):
     ys = [y_0.copy()]
     aux_evals = [0]
     for k in range(K):
-        if verbose and k % 10 == 0:
+        if verbose and k % 20 == 0:
             print(f"k={k}")
-        x_k = get_vol_center(A_k, b_k, x_k, n_steps=newton_steps)
+        x_k = get_vol_center(A_k, b_k, x_k, n_steps=newton_steps, stepsize=stepsize)
+        if (x_k < 0).any():
+            break
         H_inv = get_H_inv(A_k, b_k, x_k)
         sigmas = get_sigmas(A_k, b_k, x_k, H_inv)
         if (sigmas >= eps).all():
             c_k, y_0, aux_eval = oracle(x_k, y_0)
             aux_evals.append(aux_evals[-1] + aux_eval)
-            beta_k = get_beta(A_k, -c_k, x_k, eps, H_inv)
+            beta_k = get_beta(A_k, -c_k, x_k, eps, eta, H_inv)
             A_k, b_k = add_row(A_k, b_k, -c_k, beta_k)
         else:
             i = sigmas.argmin()
@@ -105,6 +107,6 @@ def vaidya(A_0, b_0, x_0, y_0, eps, K, oracle, newton_steps=10, verbose=False):
 def get_init_polytope(d):
     # Задать начальное множество A_0, b_0
     A_0 = np.vstack((np.eye(d), -np.ones((1, d))))
-    b_0 = -np.ones(d + 1)
-    b_0[-1] = -2
+    b_0 = np.zeros(d + 1)
+    b_0[-1] = -1
     return A_0, b_0
